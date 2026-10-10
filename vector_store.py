@@ -370,20 +370,20 @@ class StudyMateVectorStore:
             else:
                 break
 
-        # Assemble formatted contiguous stitched passage
+        # Assemble clean contiguous stitched passage without debug labels
         parts = []
         surrounding_ids = []
 
         if prev_texts:
             for p_id, p_m, p_t in prev_texts:
-                parts.append(f"⏮️ [Preceding Context • {p_m.get('unit_type')} {p_m.get('unit_number')}: {p_m.get('heading')}]\n{p_t}")
+                parts.append(p_t)
                 surrounding_ids.append(p_id)
 
-        parts.append(f"🎯 [Matched Passage • {meta.get('unit_type')} {meta.get('unit_number')}: {meta.get('heading')}]\n{core_text}")
+        parts.append(core_text)
 
         if next_texts:
             for n_id, n_m, n_t in next_texts:
-                parts.append(f"⏭️ [Following Context • {n_m.get('unit_type')} {n_m.get('unit_number')}: {n_m.get('heading')}]\n{n_t}")
+                parts.append(n_t)
                 surrounding_ids.append(n_id)
 
         expanded_text = "\n\n".join(parts)
@@ -433,7 +433,7 @@ class StudyMateVectorStore:
                     "text": raw_text,
                     "metadata": metadata,
                     "distance": round(distance, 4),
-                    "score": similarity,
+                    "score": round(similarity, 4),
                     "source": "dense"
                 })
 
@@ -535,10 +535,43 @@ class StudyMateVectorStore:
             # Normalize RRF to 0-100 percentage
             hybrid_confidence = round((raw_rrf / max_rrf) * 100, 1)
 
+            dense_item = next((d for d in dense_results if d["chunk_id"] == cid), None)
+            bm25_item = next((b for b in bm25_results if b["chunk_id"] == cid), None)
+
+            d_score = dense_item["score"] if dense_item is not None else 0.0
+            b_score = bm25_item["score"] if bm25_item is not None else 0.0
+
+            # Combined raw similarity
+            if dense_item is not None and bm25_item is not None:
+                raw_score = (d_score * 0.6) + (b_score * 0.4)
+            elif dense_item is not None:
+                raw_score = d_score
+            elif bm25_item is not None:
+                raw_score = b_score * 0.9
+            else:
+                raw_score = (hybrid_confidence / 100.0) * 0.85
+
+            # Calibrate raw similarity to an intuitive 0-100% score:
+            # High-confidence direct answers reflect 80-98%, moderate matches 50-79%
+            if raw_score >= 0.60:
+                calibrated_pct = min(99.0, 80.0 + ((raw_score - 0.60) / 0.35) * 19.0)
+            elif raw_score >= 0.30:
+                calibrated_pct = 50.0 + ((raw_score - 0.30) / 0.30) * 30.0
+            else:
+                calibrated_pct = max(20.0, raw_score * 166.0)
+
+            sim_pct = round(calibrated_pct, 1)
+            sim_score = round(sim_pct / 100.0, 4)
+
             entry = {
                 "chunk_id": cid,
                 "text": item["text"],
                 "metadata": item["metadata"],
+                "similarity_score": sim_score,
+                "similarity_percent": sim_pct,
+                "score": sim_score,
+                "dense_score": round(d_score, 4),
+                "bm25_score": round(b_score, 4),
                 "hybrid_score": hybrid_confidence,
                 "dense_rank": dense_ranks.get(cid, "-"),
                 "bm25_rank": bm25_ranks.get(cid, "-"),
