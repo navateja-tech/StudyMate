@@ -1,7 +1,8 @@
 import os
 import io
 import re
-from typing import Dict, Any, List, Optional, Tuple
+import hashlib
+from typing import Dict, Any, List, Optional, Tuple, Set
 from PIL import Image
 import pymupdf as fitz
 from docx import Document as DocxDocument
@@ -27,7 +28,7 @@ class ExtractedImage:
         self.image_format = (image_format or "png").lower().replace("jpeg", "jpg")
         self.width = width
         self.height = height
-        self.caption = caption or f"Image from {unit_type} {unit_number}"
+        self.caption = caption or f"Figure from {unit_type} {unit_number}"
 
 class ExtractedTable:
     """Represents a structured table extracted from a document or presentation."""
@@ -88,7 +89,7 @@ class DocumentExtractionResult:
         self.total_units = len(self.units)
         self.total_words = sum(getattr(u, 'word_count', 0) for u in self.units)
 
-        # Aggregate all images across units if not supplied explicitly
+        # Aggregate all images strictly from units
         if all_images is not None:
             self.all_images: List[ExtractedImage] = all_images
         else:
@@ -97,7 +98,7 @@ class DocumentExtractionResult:
                 if hasattr(u, "images") and u.images:
                     self.all_images.extend(u.images)
 
-        # Aggregate all tables across units if not supplied explicitly
+        # Aggregate all tables strictly from units
         if all_tables is not None:
             self.all_tables: List[ExtractedTable] = all_tables
         else:
@@ -107,7 +108,7 @@ class DocumentExtractionResult:
                     self.all_tables.extend(u.tables)
 
     def __getattr__(self, name: str):
-        """Defensive attribute fallback to prevent AttributeError."""
+        """Defensive attribute fallback."""
         if name == "all_images":
             imgs = []
             for u in getattr(self, "units", []):
@@ -126,7 +127,28 @@ class DocumentExtractionResult:
 
 
 class DocumentExtractor:
-    """Multi-format deep extractor for PDF, PPTX, DOCX, TXT, and Images."""
+    """
+    Multi-format deep extractor for PDF, PPTX, DOCX, TXT, and Images.
+    Strictly extracts ONLY actual content figures and tables belonging to the document,
+    filtering out background templates, bullet icons, header logos, and package artifacts.
+    """
+
+    @staticmethod
+    def _is_valid_content_image(width: int, height: int) -> bool:
+        """
+        Filters out decorative icons, bullet graphics, horizontal rule lines,
+        and tiny spacers that are not genuine course diagrams/figures.
+        """
+        # Minimum resolution: at least 100x100 or total area >= 15,000 px
+        if width < 100 or height < 100 or (width * height < 15000):
+            return False
+
+        # Extreme aspect ratio check (filters out 1200x5 divider lines or 5x800 border bars)
+        aspect = width / max(height, 1)
+        if aspect > 7.0 or aspect < 0.14:
+            return False
+
+        return True
 
     @staticmethod
     def extract_from_bytes(filename: str, file_bytes: bytes) -> DocumentExtractionResult:
@@ -150,6 +172,29 @@ class DocumentExtractor:
         units: List[DocumentUnit] = []
         headings: List[str] = []
         seen_headings = set()
+
+        # Pass 1: Discover images and detect repeating template/header logos across pages
+        # If an identical image hash appears on > 2 pages in a document, it's a template header/footer logo
+        image_page_occurrences: Dict[str, Set[int]] = {}
+        for page_idx in range(len(doc)):
+            p = doc[page_idx]
+            for img_info in p.get_images(full=True):
+                try:
+                    xref = img_info[0]
+                    b_img = doc.extract_image(xref)
+                    if b_img and b_img.get("image"):
+                        h = hashlib.sha256(b_img["image"]).hexdigest()
+                        if h not in image_page_occurrences:
+                            image_page_occurrences[h] = set()
+                        image_page_occurrences[h].add(page_idx + 1)
+                except Exception:
+                    continue
+
+        repeating_logo_hashes = {
+            h for h, pages in image_page_occurrences.items()
+            if len(pages) > 2 and len(doc) >= 3
+        }
+
         img_counter = 1
 
         for page_idx in range(len(doc)):
@@ -180,13 +225,17 @@ class DocumentExtractor:
             except Exception:
                 pass
 
-            # 3. Embedded Images extraction
+            # 3. Embedded Images extraction strictly for this page
             page_images: List[ExtractedImage] = []
+            seen_page_xrefs = set()
             try:
-                image_list = page.get_images(full=True)
-                for img_info in image_list:
+                for img_info in page.get_images(full=True):
+                    xref = img_info[0]
+                    if xref in seen_page_xrefs:
+                        continue
+                    seen_page_xrefs.add(xref)
+
                     try:
-                        xref = img_info[0]
                         base_image = doc.extract_image(xref)
                         if not base_image:
                             continue
@@ -195,8 +244,16 @@ class DocumentExtractor:
                         width = base_image.get("width", 0)
                         height = base_image.get("height", 0)
 
-                        # Filter out tiny icon/spacer bullets (< 40x40)
-                        if width >= 40 and height >= 40 and img_bytes:
+                        if not img_bytes:
+                            continue
+
+                        # Check if it's a repeating header/footer logo
+                        img_hash = hashlib.sha256(img_bytes).hexdigest()
+                        if img_hash in repeating_logo_hashes:
+                            continue
+
+                        # Verify resolution and content validity
+                        if DocumentExtractor._is_valid_content_image(width, height):
                             page_images.append(ExtractedImage(
                                 image_id=f"pdf_img_{img_counter}",
                                 unit_number=page_num,
@@ -205,7 +262,7 @@ class DocumentExtractor:
                                 image_format=img_ext,
                                 width=width,
                                 height=height,
-                                caption=f"Diagram/Figure {img_counter} (Page {page_num}, {width}x{height} px)"
+                                caption=f"Figure {img_counter} (Page {page_num}, {width}x{height} px)"
                             ))
                             img_counter += 1
                     except Exception:
@@ -235,7 +292,7 @@ class DocumentExtractor:
 
             # Fallback label if page is visual only
             if not text and page_images:
-                text = f"(Page {page_num} contains visual diagrams or images without selectable text)"
+                text = f"(Page {page_num} contains visual diagrams or figures without selectable text)"
             elif not text:
                 text = f"(Page {page_num} is blank or contains no selectable text)"
 
@@ -265,6 +322,25 @@ class DocumentExtractor:
         units: List[DocumentUnit] = []
         headings: List[str] = []
         seen_headings = set()
+
+        # Track slide occurrences to filter out repeating slide master logos
+        image_slide_counts: Dict[str, Set[int]] = {}
+        for idx, slide in enumerate(prs.slides):
+            for shape in slide.shapes:
+                if hasattr(shape, "image"):
+                    try:
+                        h = hashlib.sha256(shape.image.blob).hexdigest()
+                        if h not in image_slide_counts:
+                            image_slide_counts[h] = set()
+                        image_slide_counts[h].add(idx + 1)
+                    except Exception:
+                        pass
+
+        repeating_logos = {
+            h for h, slides in image_slide_counts.items()
+            if len(slides) > 2 and len(prs.slides) >= 3
+        }
+
         img_counter = 1
 
         for i, slide in enumerate(prs.slides):
@@ -284,25 +360,28 @@ class DocumentExtractor:
                                 slide_title = text
                             slide_texts.append(text)
 
-                # Embedded images
+                # Embedded images strictly on this slide
                 if hasattr(shape, "image"):
                     try:
-                        img = shape.image
-                        img_bytes = img.blob
-                        img_ext = img.ext or "png"
-                        with Image.open(io.BytesIO(img_bytes)) as pil_img:
+                        img_blob = shape.image.blob
+                        img_hash = hashlib.sha256(img_blob).hexdigest()
+                        if img_hash in repeating_logos:
+                            continue
+
+                        img_ext = shape.image.ext or "png"
+                        with Image.open(io.BytesIO(img_blob)) as pil_img:
                             w, h = pil_img.size
 
-                        if w >= 40 and h >= 40:
+                        if DocumentExtractor._is_valid_content_image(w, h):
                             slide_images.append(ExtractedImage(
                                 image_id=f"pptx_img_{img_counter}",
                                 unit_number=slide_num,
                                 unit_type="Slide",
-                                image_bytes=img_bytes,
+                                image_bytes=img_blob,
                                 image_format=img_ext,
                                 width=w,
                                 height=h,
-                                caption=f"Slide {slide_num} Image ({w}x{h})"
+                                caption=f"Slide {slide_num} Figure ({w}x{h})"
                             ))
                             img_counter += 1
                     except Exception:
@@ -376,32 +455,7 @@ class DocumentExtractor:
         headings: List[str] = []
         seen_headings = set()
 
-        # Extract embedded images from Word document parts
-        doc_images: List[ExtractedImage] = []
-        img_counter = 1
-        for rel in doc.part.related_parts.values():
-            if "image" in rel.content_type:
-                try:
-                    img_bytes = rel.blob
-                    with Image.open(io.BytesIO(img_bytes)) as pil_img:
-                        w, h = pil_img.size
-                        fmt = pil_img.format or "png"
-                    if w >= 40 and h >= 40:
-                        doc_images.append(ExtractedImage(
-                            image_id=f"docx_img_{img_counter}",
-                            unit_number=1,
-                            unit_type="Section",
-                            image_bytes=img_bytes,
-                            image_format=fmt.lower(),
-                            width=w,
-                            height=h,
-                            caption=f"Embedded Image {img_counter} ({w}x{h})"
-                        ))
-                        img_counter += 1
-                except Exception:
-                    pass
-
-        # Extract tables from docx
+        # Extract structured tables from docx
         doc_tables: List[ExtractedTable] = []
         for t_idx, table in enumerate(doc.tables):
             table_rows = []
@@ -420,27 +474,99 @@ class DocumentExtractor:
                     title=f"Document Table {t_idx + 1}"
                 ))
 
-        # Extract sections and paragraphs
+        # Track which paragraph contains which image strictly via XML r:embed / r:id
+        img_counter = 1
         current_heading = "Overview"
-        current_paras = []
+        current_paras: List[str] = []
+        current_images: List[ExtractedImage] = []
         section_idx = 1
 
         for p in doc.paragraphs:
-            text = p.text.strip()
-            if not text:
-                continue
+            text = p.strip() if hasattr(p, "strip") else p.text.strip()
 
-            is_heading = p.style.name.startswith("Heading") or re.match(r'^(chapter|unit|section|\d+\.)\b', text, re.IGNORECASE)
-            if is_heading and len(text) < 100:
-                if current_paras:
+            # Check if this paragraph contains an actually referenced body image
+            p_xml = p._element.xml
+            drawings = re.findall(r'<w:drawing[^>]*>.*?</w:drawing>', p_xml, re.DOTALL) or [p_xml] if ('embed="' in p_xml or 'id="' in p_xml) else []
+            for d_xml in drawings:
+                embed_match = re.search(r'embed="([^"]+)"', d_xml) or re.search(r'id="([^"]+)"', d_xml)
+                if not embed_match:
+                    continue
+                eid = embed_match.group(1)
+                part = doc.part.related_parts.get(eid)
+                if part and hasattr(part, "content_type") and "image" in part.content_type:
+                    try:
+                        img_bytes = part.blob
+                        with Image.open(io.BytesIO(img_bytes)) as pil_img:
+                            w, h = pil_img.size
+                            fmt = (pil_img.format or "png").lower()
+
+                            # If Word applied an internal crop rectangle (<a:srcRect>), apply it strictly!
+                            sr_match = re.search(r'<a:srcRect([^>]*)/>', d_xml)
+                            if sr_match:
+                                sr_attrs = sr_match.group(1)
+                                l_m = re.search(r'l="(\d+)"', sr_attrs)
+                                t_m = re.search(r't="(\d+)"', sr_attrs)
+                                r_m = re.search(r'r="(\d+)"', sr_attrs)
+                                b_m = re.search(r'b="(\d+)"', sr_attrs)
+                                l = int(l_m.group(1)) if l_m else 0
+                                t = int(t_m.group(1)) if t_m else 0
+                                r = int(r_m.group(1)) if r_m else 0
+                                b = int(b_m.group(1)) if b_m else 0
+
+                                if l or t or r or b:
+                                    left_px = max(0, int(w * l / 100000))
+                                    top_px = max(0, int(h * t / 100000))
+                                    right_px = min(w, int(w * (100000 - r) / 100000))
+                                    bottom_px = min(h, int(h * (100000 - b) / 100000))
+                                    if right_px > left_px and bottom_px > top_px:
+                                        pil_img = pil_img.crop((left_px, top_px, right_px, bottom_px))
+                                        w, h = pil_img.size
+
+                            # Re-encode cropped image to bytes
+                            buf = io.BytesIO()
+                            save_fmt = "PNG" if fmt in ["png", "webp", "gif"] else "JPEG"
+                            pil_img.save(buf, format=save_fmt)
+                            cropped_bytes = buf.getvalue()
+
+                        # Accept valid figures and formula diagrams (>= 40x30)
+                        if w >= 40 and h >= 30:
+                            current_images.append(ExtractedImage(
+                                image_id=f"docx_img_{img_counter}",
+                                unit_number=section_idx,
+                                unit_type="Section",
+                                image_bytes=cropped_bytes,
+                                image_format=save_fmt.lower(),
+                                width=w,
+                                height=h,
+                                caption=f"Figure {img_counter} ({w}x{h})"
+                            ))
+                            img_counter += 1
+                    except Exception:
+                        pass
+
+            style_name = p.style.name if p.style else ""
+            is_heading = (style_name and style_name.lower().startswith("heading")) or (
+                len(text) < 70 and (
+                    bool(re.match(r'^(chapter|unit|section|part)\s+\d+[:.\s\-]*$', text, re.IGNORECASE)) or
+                    bool(re.match(r'^(chapter|unit|section|part)\s+\d+[:.\-]\s*[A-Z]', text, re.IGNORECASE)) or
+                    bool(re.match(r'^\d+(\.\d+)*\s+[A-Z]', text)) or
+                    text.startswith("#")
+                )
+            )
+
+            if is_heading:
+                if current_paras or current_images:
                     units.append(DocumentUnit(
                         unit_number=section_idx,
                         unit_type="Section",
-                        text="\n\n".join(current_paras),
-                        heading=current_heading
+                        text="\n\n".join(current_paras) if current_paras else "(Visual Section)",
+                        heading=current_heading,
+                        images=current_images
                     ))
                     section_idx += 1
                     current_paras = []
+                    current_images = []
+
                 current_heading = text
                 if text not in seen_headings:
                     headings.append(text)
@@ -448,12 +574,13 @@ class DocumentExtractor:
             else:
                 current_paras.append(text)
 
-        if current_paras:
+        if current_paras or current_images:
             units.append(DocumentUnit(
                 unit_number=section_idx,
                 unit_type="Section",
-                text="\n\n".join(current_paras),
-                heading=current_heading
+                text="\n\n".join(current_paras) if current_paras else "(Visual Section)",
+                heading=current_heading,
+                images=current_images
             ))
 
         if not units:
@@ -464,9 +591,8 @@ class DocumentExtractor:
                 heading="Overview"
             ))
 
-        # Attach images and tables to the first unit if available
-        if units:
-            units[0].images = doc_images
+        # Attach doc tables to the first unit if available
+        if units and doc_tables:
             units[0].tables = doc_tables
 
         return DocumentExtractionResult(
